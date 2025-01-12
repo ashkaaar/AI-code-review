@@ -1,0 +1,19 @@
+name: "AI Code Review Action"
+description: "Perform code reviews and comment on diffs using OpenAI API."
+inputs:
+  GITHUB_TOKEN:
+    required: true
+  OPENAI_API_KEY:
+    required: true
+  OPENAI_API_MODEL:
+    required: false
+    default: "gpt-4"
+  exclude:
+    required: false
+    default: ""
+runs:
+  using: "node16"
+  main: "dist/index.js"
+branding:
+  icon: "aperture"
+  color: "green"

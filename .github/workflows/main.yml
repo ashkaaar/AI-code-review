@@ -1,0 +1,33 @@
+name: Code Review with OpenAI
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [main, develop]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  code_review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - uses: actions-ecosystem/action-add-labels@v1
+        with:
+          labels: ai-review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: freeedcom/ai-codereviewer@main
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_MODEL: "gpt-4-1106-preview"
+          exclude: "yarn.lock,dist/**"
+  
