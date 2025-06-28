@@ -52,7 +52,7 @@
 
 ### 📘 About
 
-**CodeSense AI** is a GitHub Action that automates your pull request reviews using the power of GPT-4.  
+**CodeGuy AI** is a GitHub Action that automates your pull request reviews using the power of GPT-4.  
 It reads your code, understands your intent, and provides focused suggestions — just like a human reviewer, but 24/7 and 10x faster.
 
 ---
