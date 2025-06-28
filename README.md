@@ -1,4 +1,4 @@
-# 🤖 **CodeSense AI **
+# 🤖 **CodeGuy AI **
 
 ✨ *Your AI-powered GitHub Code Reviewer using GPT-4.* ✨
 
