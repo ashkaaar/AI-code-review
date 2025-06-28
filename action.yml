@@ -1,19 +1,263 @@
-name: "AI Code Review Action"
-description: "Perform code reviews and comment on diffs using OpenAI API."
-inputs:
-  GITHUB_TOKEN:
-    required: true
-  OPENAI_API_KEY:
-    required: true
-  OPENAI_API_MODEL:
-    required: false
-    default: "gpt-4"
-  exclude:
-    required: false
-    default: ""
-runs:
-  using: "node16"
-  main: "dist/index.js"
-branding:
-  icon: "aperture"
-  color: "green"
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/bmatcuk/doublestar/v4"
+	"github.com/google/go-github/v55/github"
+	"github.com/sashabaranov/go-openai"
+	"github.com/sourcegraph/go-diff/diff"
+	"golang.org/x/oauth2"
+)
+
+func main() {
+	ctx := context.Background()
+
+	githubToken := os.Getenv("GITHUB_TOKEN")
+	openaiApiKey := os.Getenv("OPENAI_API_KEY")
+	openaiModel := os.Getenv("OPENAI_API_MODEL")
+	if openaiModel == "" {
+		openaiModel = "gpt-4"
+	}
+	excludePatterns := strings.Split(os.Getenv("EXCLUDE"), ",")
+
+	eventPath := os.Getenv("GITHUB_EVENT_PATH")
+	eventData, err := ioutil.ReadFile(eventPath)
+	if err != nil {
+		fmt.Println("Error reading event file:", err)
+		os.Exit(1)
+	}
+
+	var eventPayload struct {
+		Repository struct {
+			Owner struct {
+				Login string `json:"login"`
+			} `json:"owner"`
+			Name string `json:"name"`
+		} `json:"repository"`
+		Number int    `json:"number"`
+		Action string `json:"action"`
+		Before string `json:"before"`
+		After  string `json:"after"`
+	}
+
+	if err := json.Unmarshal(eventData, &eventPayload); err != nil {
+		fmt.Println("Error unmarshalling event JSON:", err)
+		os.Exit(1)
+	}
+
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: githubToken})
+	tc := oauth2.NewClient(ctx, ts)
+	ghClient := github.NewClient(tc)
+
+	openaiClient := openai.NewClient(openaiApiKey)
+
+	// Fetch PR details
+	pr, _, err := ghClient.PullRequests.Get(ctx, eventPayload.Repository.Owner.Login, eventPayload.Repository.Name, eventPayload.Number)
+	if err != nil {
+		fmt.Println("Error fetching PR details:", err)
+		os.Exit(1)
+	}
+
+	var diffText string
+	switch eventPayload.Action {
+	case "opened":
+		diffText, err = fetchPRDiff(ctx, ghClient, eventPayload)
+		if err != nil {
+			fmt.Println("Error fetching PR diff:", err)
+			os.Exit(1)
+		}
+	case "synchronize":
+		diffText, err = compareCommitsDiff(ctx, ghClient, eventPayload)
+		if err != nil {
+			fmt.Println("Error fetching commit comparison diff:", err)
+			os.Exit(1)
+		}
+	default:
+		fmt.Println("Event not supported:", eventPayload.Action)
+		os.Exit(0)
+	}
+
+	if diffText == "" {
+		fmt.Println("No diff to analyze.")
+		os.Exit(0)
+	}
+
+	files, err := diff.ParseMultiFileDiff([]byte(diffText))
+	if err != nil {
+		fmt.Println("Error parsing diff:", err)
+		os.Exit(1)
+	}
+
+	filteredFiles := filterFiles(files, excludePatterns)
+
+	comments := []github.DraftReviewComment{}
+
+	for _, file := range filteredFiles {
+		if file.NewName == "/dev/null" {
+			continue // skip deleted files
+		}
+
+		for _, chunk := range file.Hunks {
+			prompt := buildPrompt(pr.GetTitle(), pr.GetBody(), file.NewName, chunk)
+			reviews, err := queryOpenAI(ctx, openaiClient, prompt, openaiModel)
+			if err != nil {
+				fmt.Println("OpenAI query error:", err)
+				continue
+			}
+			for _, rev := range reviews {
+				line, err := strconv.Atoi(rev.LineNumber)
+				if err != nil {
+					continue
+				}
+				comments = append(comments, github.DraftReviewComment{
+					Path: file.NewName,
+					Line: line,
+					Body: rev.ReviewComment,
+				})
+			}
+		}
+	}
+
+	if len(comments) > 0 {
+		_, _, err := ghClient.PullRequests.CreateReview(ctx, eventPayload.Repository.Owner.Login, eventPayload.Repository.Name, eventPayload.Number, &github.PullRequestReviewRequest{
+			Comments: comments,
+			Event:    github.String("COMMENT"),
+		})
+		if err != nil {
+			fmt.Println("Error posting review comments:", err)
+			os.Exit(1)
+		}
+		fmt.Println("Posted review comments.")
+	} else {
+		fmt.Println("No comments to post.")
+	}
+}
+
+func fetchPRDiff(ctx context.Context, ghClient *github.Client, eventPayload interface{}) (string, error) {
+	payload := eventPayload.(struct {
+		Repository struct {
+			Owner struct {
+				Login string `json:"login"`
+			} `json:"owner"`
+			Name string `json:"name"`
+		} `json:"repository"`
+		Number int `json:"number"`
+		Action string `json:"action"`
+		Before string `json:"before"`
+		After  string `json:"after"`
+	})
+	resp, _, err := ghClient.PullRequests.GetRaw(ctx, payload.Repository.Owner.Login, payload.Repository.Name, payload.Number, github.RawOptions{Type: github.Diff})
+	if err != nil {
+		return "", err
+	}
+	return resp, nil
+}
+
+func compareCommitsDiff(ctx context.Context, ghClient *github.Client, eventPayload interface{}) (string, error) {
+	payload := eventPayload.(struct {
+		Repository struct {
+			Owner struct {
+				Login string `json:"login"`
+			} `json:"owner"`
+			Name string `json:"name"`
+		} `json:"repository"`
+		Number int    `json:"number"`
+		Action string `json:"action"`
+		Before string `json:"before"`
+		After  string `json:"after"`
+	})
+	compare, _, err := ghClient.Repositories.CompareCommits(ctx, payload.Repository.Owner.Login, payload.Repository.Name, payload.Before, payload.After, github.ListOptions{})
+	if err != nil {
+		return "", err
+	}
+	return compare.GetDiff(), nil
+}
+
+func filterFiles(files []*diff.FileDiff, excludePatterns []string) []*diff.FileDiff {
+	filtered := []*diff.FileDiff{}
+	for _, f := range files {
+		excluded := false
+		for _, pattern := range excludePatterns {
+			if pattern == "" {
+				continue
+			}
+			match, _ := doublestar.PathMatch(pattern, f.NewName)
+			if match {
+				excluded = true
+				break
+			}
+		}
+		if !excluded {
+			filtered = append(filtered, f)
+		}
+	}
+	return filtered
+}
+
+func buildPrompt(prTitle, prBody, fileName string, hunk *diff.Hunk) string {
+	lines := strings.Split(string(hunk.Body), "\n")
+	content := strings.Join(lines, "\n")
+	return fmt.Sprintf(`
+You are a code review bot.
+
+- Respond with JSON: {"reviews": [{"lineNumber": <line>, "reviewComment": "<comment>"}]}
+- Only comment if there is room for improvement; otherwise, reviews is an empty array.
+- No compliments or positive feedback.
+- Use GitHub Markdown.
+- Use PR title and description as context.
+- Do NOT suggest adding comments to the code.
+
+PR Title: %s
+PR Description:
+
+---
+%s
+---
+
+Diff of file "%s":
+
+\`\`\`diff
+%s
+\`\`\`
+`, prTitle, prBody, fileName, content)
+}
+
+type Review struct {
+	LineNumber    string `json:"lineNumber"`
+	ReviewComment string `json:"reviewComment"`
+}
+
+func queryOpenAI(ctx context.Context, client *openai.Client, prompt, model string) ([]Review, error) {
+	resp, err := client.Chat.Completions.Create(ctx, openai.ChatCompletionRequest{
+		Model: model,
+		Messages: []openai.ChatCompletionMessage{
+			{
+				Role:    "system",
+				Content: prompt,
+			},
+		},
+		Temperature:      0.2,
+		MaxTokens:       700,
+		TopP:             1,
+		FrequencyPenalty: 0,
+		PresencePenalty:  0,
+	})
+	if err != nil {
+		return nil, err
+	}
+	content := resp.Choices[0].Message.Content
+	var result struct {
+		Reviews []Review `json:"reviews"`
+	}
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		return nil, err
+	}
+	return result.Reviews, nil
+}
